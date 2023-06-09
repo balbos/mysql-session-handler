@@ -1,145 +1,142 @@
-<?php
+<?php declare(strict_types=1);
 
-namespace Pematon\Session;
+namespace JanHarsa\Session;
 
-use Nette;
+use Nextras\Dbal\Connection;
 
-/**
- * Storing session to database.
- * Inspired by: https://github.com/JedenWeb/SessionStorage/
- */
-class MysqlSessionHandler implements \SessionHandlerInterface
+final class MysqlSessionHandler implements \SessionHandlerInterface
 {
-	private $tableName;
 
-	/** @var Nette\Database\Context */
-	private $context;
+    const LOCK_TIMEOUT = 10;
+    private $tableName;
+    private $connection;
+    private $lockName = '';
 
-	private $lockId;
+    public function __construct(Connection $connection)
+    {
+        $this->connection = $connection;
 
-	public function __construct(Nette\Database\Context $context)
-	{
-		$this->context = $context;
-	}
+    }
 
-	public function setTableName($tableName)
-	{
-		$this->tableName = $tableName;
-	}
+    public function setTableName($tableName)
+    {
+        $this->tableName = $tableName;
+        $this->connection->query("
+            CREATE TABLE IF NOT EXISTS `$this->tableName` (
+                `id` VARBINARY(128) NOT NULL PRIMARY KEY,
+                `time` int UNSIGNED NOT NULL,
+                `data` LONGTEXT NOT NULL
+            ) COLLATE 'utf8_general_ci';
+        ");
+    }
 
-	protected function hash($id)
-	{
-		return md5($id);
-	}
+    /**
+     * Close the session
+     * @link https://php.net/manual/en/sessionhandlerinterface.close.php
+     * @return bool <p>
+     * The return value (usually TRUE on success, FALSE on failure).
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function close() : bool
+    {
+        $this->connection->query("SELECT RELEASE_LOCK('$this->lockName')");
+        return true;
+    }
 
-	private function lock() {
-		if ($this->lockId === null) {
-			$this->lockId = md5(session_id());
-			while (!$this->context->query("SELECT GET_LOCK(?, 1) as `lock`", $this->lockId)->fetch()->lock);
-		}
-	}
+    /**
+     * Destroy a session
+     * @link https://php.net/manual/en/sessionhandlerinterface.destroy.php
+     * @param string $session_id The session ID being destroyed.
+     * @return bool <p>
+     * The return value (usually TRUE on success, FALSE on failure).
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function destroy($session_id) : bool
+    {
+        $this->connection->query("DELETE FROM $this->tableName WHERE id = %s", $session_id);
+        return true;
+    }
 
-	private function unlock() {
-		if ($this->lockId === null) {
-			return;
-		}
+    /**
+     * Cleanup old sessions
+     * @link https://php.net/manual/en/sessionhandlerinterface.gc.php
+     * @param int $maxlifetime <p>
+     * Sessions that have not updated for
+     * the last maxlifetime seconds will be removed.
+     * </p>
+     * @return bool <p>
+     * The return value (usually TRUE on success, FALSE on failure).
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function gc($maxlifetime) : int|false
+    {
+        $this->connection->query("DELETE FROM $this->tableName WHERE time < %i", (time() - $maxlifetime));
+        return true;
+    }
 
-		$this->context->query("SELECT RELEASE_LOCK(?)", $this->lockId);
-		$this->lockId = null;
-	}
+    /**
+     * Initialize session
+     * @link https://php.net/manual/en/sessionhandlerinterface.open.php
+     * @param string $save_path The path where to store/retrieve the session.
+     * @param string $name The session name.
+     * @return bool <p>
+     * The return value (usually TRUE on success, FALSE on failure).
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function open($save_path, $name) : bool
+    {
+        $this->lockName = 'session_' . session_id();
+        $this->connection->query("SELECT GET_LOCK('$this->lockName', %i)", self::LOCK_TIMEOUT);
+        return true;
+    }
 
-	public function open($savePath, $name)
-	{
-		$this->lock();
+    /**
+     * Read session data
+     * @link https://php.net/manual/en/sessionhandlerinterface.read.php
+     * @param string $session_id The session id to read data for.
+     * @return string <p>
+     * Returns an encoded string of the read data.
+     * If nothing was read, it must return an empty string.
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function read($session_id) : string|false
+    {
+        $result = $this->connection->query("SELECT data FROM $this->tableName s WHERE s.id = %s", $session_id);
+        if ($row = $result->fetch())
+            return $row->data;
+        return "";
+    }
 
-		return TRUE;
-	}
-
-	public function close()
-	{
-		$this->unlock();
-
-		return TRUE;
-	}
-
-	public function destroy($sessionId)
-	{
-		$hashedSessionId = $this->hash($sessionId);
-
-		$this->context->table($this->tableName)->where('id', $hashedSessionId)->delete();
-
-		$this->unlock();
-
-		return TRUE;
-	}
-
-	public function read($sessionId)
-	{
-		$this->lock();
-
-		$hashedSessionId = $this->hash($sessionId);
-
-		$row = $this->context->table($this->tableName)->get($hashedSessionId);
-
-		if ($row) {
-			return $row->data;
-		}
-
-		return '';
-	}
-
-	public function write($sessionId, $sessionData)
-	{
-		$this->lock();
-
-		$hashedSessionId = $this->hash($sessionId);
-		$time = time();
-
-		if ($row = $this->context->table($this->tableName)->get($hashedSessionId)) {
-			if ($row->data !== $sessionData) {
-				$row->update(array(
-					'timestamp' => $time,
-					'data' => $sessionData,
-				));
-			} else if ($time - $row->timestamp > 300) {
-				// Optimization: When data has not been changed, only update
-				// the timestamp after 5 minutes.
-				$row->update(array(
-					'timestamp' => $time,
-				));
-			}
-		} else {
-			$this->context->table($this->tableName)->insert(array(
-				'id' => $hashedSessionId,
-				'timestamp' => $time,
-				'data' => $sessionData,
-			));
-		}
-
-		return TRUE;
-	}
-
-	public function gc($maxLifeTime)
-	{
-		$maxTimestamp = time() - $maxLifeTime;
-
-		// Try to avoid a conflict when running garbage collection simultaneously on two
-		// MySQL servers at a very busy site in a master-master replication setup by
-		// subtracting one tenth of $maxLifeTime (but at least one day) from $maxTimestamp
-		// for each server with reasonably small ID except for the server with ID 1.
-		//
-		// In a typical master-master replication setup, the server IDs are 1 and 2.
-		// There is no subtraction on server 1 and one day (or one tenth of $maxLifeTime)
-		// subtraction on server 2.
-		$serverId = $this->context->query("SELECT @@server_id as `server_id`")->fetch()->server_id;
-		if ($serverId > 1 && $serverId < 10) {
-			$maxTimestamp -= ($serverId - 1) * max(86400, $maxLifeTime / 10);
-		}
-
-		$this->context->table($this->tableName)
-			->where('timestamp < ?', $maxTimestamp)
-			->delete();
-
-		return TRUE;
-	}
+    /**
+     * Write session data
+     * @link https://php.net/manual/en/sessionhandlerinterface.write.php
+     * @param string $session_id The session id.
+     * @param string $session_data <p>
+     * The encoded session data. This data is the
+     * result of the PHP internally encoding
+     * the $_SESSION superglobal to a serialized
+     * string and passing it as this parameter.
+     * Please note sessions use an alternative serialization method.
+     * </p>
+     * @return bool <p>
+     * The return value (usually TRUE on success, FALSE on failure).
+     * Note this value is returned internally to PHP for processing.
+     * </p>
+     * @since 5.4.0
+     */
+    public function write($session_id, $session_data) : bool
+    {
+        $this->connection->query("REPLACE INTO $this->tableName (id, time, data) VALUES (%s, %i, %s)", $session_id, time(), $session_data);
+        return true;
+    }
 }
